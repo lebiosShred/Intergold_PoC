@@ -107,11 +107,21 @@ def query_data():
     file_id, error = find_file_id_by_name(service, file_name_to_query)
     if error:
         return jsonify({"error": error}), 404
-    date_col = request.args.get('dateColumn', 'OrdDate')
-    group_by = request.args.get('groupBy', 'SOType')
-    usecols = [date_col, group_by]
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=usecols, parse_dates=[date_col])
+    query_params = request.args
+    requested_date_col_raw = query_params.get('dateColumn', 'OrdDate')
+    requested_group_by_raw = query_params.get('groupBy', 'SOType')
+    usecols = None  # until columns matched
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=None, parse_dates=None)
     df = next(iter(sheets.values())).copy()
+    cols = df.columns.tolist()
+    norm = {c.strip().lower(): c for c in cols}
+    req_date_key = requested_date_col_raw.strip().lower()
+    req_group_key = requested_group_by_raw.strip().lower()
+    if req_date_key not in norm or req_group_key not in norm:
+        return jsonify({"error": f"Could not find required columns. Available: {cols}"}), 400
+    date_col = norm[req_date_key]
+    group_by = norm[req_group_key]
+    df = df[[date_col, group_by]].copy()
     try:
         df[date_col] = pd.to_datetime(df[date_col])
     except Exception as e:
