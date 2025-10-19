@@ -59,18 +59,18 @@ def find_file_id_by_name(service, file_name):
     except HttpError as error:
         return None, f"An error occurred searching for file: {error}"
 
-def load_dataframe_from_drive(service, file_id, file_name, usecols=None, parse_dates=None):
+def load_dataframe_from_drive(service, file_id, file_name, usecols=None, parse_dates=None, skiprows=None):
     file_content_request = service.files().get_media(fileId=file_id)
     content = file_content_request.execute()
     if file_name.lower().endswith('.csv'):
-        df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates)
+        df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates, skiprows=skiprows)
         return {'Sheet1': df}
     else:
         try:
-            df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols)
+            df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols, skiprows=skiprows)
             return df_sheets
         except Exception:
-            df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates)
+            df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates, skiprows=skiprows)
             return {'Sheet1': df}
 
 @app.route('/')
@@ -104,21 +104,51 @@ def check_headers():
     file_name = request.args.get('fileName')
     if not file_name:
         return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
+    
+    # Optional parameter to skip rows before header
+    skip_rows = request.args.get('skipRows', 0)
+    try:
+        skip_rows = int(skip_rows)
+    except:
+        skip_rows = 0
+    
     file_id, err = find_file_id_by_name(service, file_name)
     if err:
         return jsonify({"error": err}), 404
     try:
         content = service.files().get_media(fileId=file_id).execute()
-        # Attempt CSV first
-        df = pd.read_csv(io.BytesIO(content), nrows=0)
+        # Attempt CSV first with skiprows parameter
+        df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows, nrows=5)
     except Exception:
         try:
             # Fallback to Excel if CSV fails
-            df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', nrows=0)
+            df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', skiprows=skip_rows, nrows=5)
         except Exception as ex:
             return jsonify({"error": f"Could not load file to inspect headers: {str(ex)}"}), 500
+    
     cols = df.columns.tolist()
-    return jsonify({"columns": cols})
+    
+    # Check if we got bad headers (all Unnamed or mostly numeric)
+    unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed:'))
+    numeric_count = sum(1 for c in cols if str(c).replace('.', '').replace('-', '').isdigit())
+    
+    warning = None
+    if unnamed_count > len(cols) * 0.3 or numeric_count > len(cols) * 0.3:
+        warning = "Warning: Many columns appear unnamed or numeric. The file may have headers in a different row. Try using skipRows parameter (e.g., ?skipRows=1)"
+    
+    # Also return first few rows as preview to help identify header location
+    preview = df.head(3).to_dict('records') if len(df) > 0 else []
+    
+    result = {
+        "columns": cols,
+        "columnCount": len(cols),
+        "preview": preview
+    }
+    
+    if warning:
+        result["warning"] = warning
+    
+    return jsonify(result)
 
 @app.route('/query', methods=['GET'])
 def query_data():
@@ -136,8 +166,17 @@ def query_data():
     query_params = request.args
     requested_date_col_raw = query_params.get('dateColumn', 'OrdDate')
     requested_group_by_raw = query_params.get('groupBy', 'SOType')
+    
+    # Add skipRows parameter support
+    skip_rows = query_params.get('skipRows', None)
+    if skip_rows is not None:
+        try:
+            skip_rows = int(skip_rows)
+        except:
+            skip_rows = None
+    
     usecols = None  # until columns matched
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=None, parse_dates=None)
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=None, parse_dates=None, skiprows=skip_rows)
     df = next(iter(sheets.values())).copy()
     cols = df.columns.tolist()
     norm = {c.strip().lower(): c for c in cols}
