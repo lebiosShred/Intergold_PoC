@@ -1,6 +1,7 @@
 import os
 import json
 import io
+from datetime import date
 import pandas as pd
 from flask import Flask, jsonify, request
 from google.oauth2.credentials import Credentials
@@ -10,9 +11,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 app = Flask(__name__)
-
-SCOPES = ['https://www.googleapis.com/auth/drive'] 
-
+SCOPES = ['https://www.googleapis.com/auth/drive']
 CREDENTIALS_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
 
@@ -22,16 +21,12 @@ def load_credentials_from_env():
             if not os.path.exists(CREDENTIALS_FILE):
                 with open(CREDENTIALS_FILE, 'w') as f:
                     f.write(os.environ['GOOGLE_CREDENTIALS_JSON'])
-        
         if 'GOOGLE_TOKEN_JSON' in os.environ:
             if not os.path.exists(TOKEN_FILE):
                 with open(TOKEN_FILE, 'w') as f:
                     f.write(os.environ['GOOGLE_TOKEN_JSON'])
-    
     except Exception as e:
-        print(f"Error loading credentials from environment: {e}")
         return False
-    
     return os.path.exists(CREDENTIALS_FILE) and os.path.exists(TOKEN_FILE)
 
 def get_drive_service():
@@ -42,36 +37,40 @@ def get_drive_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            print("No valid credentials.")
             return None
         with open(TOKEN_FILE, 'w') as token:
             token.write(creds.to_json())
     try:
         service = build('drive', 'v3', credentials=creds)
         return service
-    except HttpError as error:
-        print(f'An error occurred building the service: {error}')
+    except HttpError:
         return None
 
 def find_file_id_by_name(service, file_name):
     search_query = f"name contains '{file_name}' and trashed=false"
     try:
-        results = service.files().list(
-            q=search_query,
-            pageSize=5,
-            fields="files(id, name)"
-        ).execute()
-        
+        results = service.files().list(q=search_query, pageSize=5, fields="files(id, name)").execute()
         items = results.get('files', [])
-
         if not items:
             return None, f"File not found: '{file_name}'"
         if len(items) > 1:
             return None, f"Multiple files found with name: '{file_name}'. Please use a unique name."
-        
-        return items[0]['id'], None 
+        return items[0]['id'], None
     except HttpError as error:
         return None, f"An error occurred searching for file: {error}"
+
+def load_dataframe_from_drive(service, file_id, file_name):
+    file_content_request = service.files().get_media(fileId=file_id)
+    content = file_content_request.execute()
+    if file_name.lower().endswith(('.xlsx', '.xls')):
+        df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+        return df_sheets
+    else:
+        try:
+            df = pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
+        except Exception:
+            df = pd.read_csv(io.BytesIO(content), encoding='latin1')
+        return {'Sheet1': df}
 
 @app.route('/')
 def index():
@@ -85,88 +84,73 @@ def list_files():
     if not service:
         return jsonify({"error": "Could not authenticate with Google Drive."}), 500
     try:
-        results = service.files().list(
-            pageSize=20,
-            fields="nextPageToken, files(id, name, mimeType)"
-        ).execute()
+        results = service.files().list(pageSize=20, fields="nextPageToken, files(id, name, mimeType)").execute()
         items = results.get('files', [])
         if not items:
             return jsonify({"message": "No files found."})
-        file_list = [
-            {"name": item['name'], "id": item['id'], "type": item['mimeType']}
-            for item in items
-        ]
+        file_list = [{"name": item['name'], "id": item['id'], "type": item['mimeType']} for item in items]
         return jsonify({"files": file_list})
     except HttpError as error:
         return jsonify({"error": str(error)}), 500
+
+@app.route('/sheets', methods=['GET'])
+def list_sheets():
+    if not load_credentials_from_env():
+        return jsonify({"error": "Server is not configured with Google credentials."}), 500
+    service = get_drive_service()
+    if not service:
+        return jsonify({"error": "Could not authenticate with Google Drive."}), 500
+    file_name_to_query = request.args.get('fileName')
+    if not file_name_to_query:
+        return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
+    file_id, error = find_file_id_by_name(service, file_name_to_query)
+    if error:
+        return jsonify({"error": error}), 404
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query)
+    return jsonify({"sheets": list(sheets.keys())})
 
 @app.route('/query', methods=['GET'])
 def query_data():
     if not load_credentials_from_env():
         return jsonify({"error": "Server is not configured with Google credentials."}), 500
-    
     service = get_drive_service()
     if not service:
         return jsonify({"error": "Could not authenticate with Google Drive."}), 500
-
     query_params = request.args
-    
     file_name_to_query = query_params.get('fileName')
     if not file_name_to_query:
         return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
-
+    file_id, error = find_file_id_by_name(service, file_name_to_query)
+    if error:
+        return jsonify({"error": error}), 404
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query)
+    sheet_name = query_params.get('sheetName')
+    if sheet_name and sheet_name in sheets:
+        df = sheets[sheet_name].copy()
+    else:
+        df = next(iter(sheets.values())).copy()
+    date_col = query_params.get('dateColumn', 'OrderDate')
     try:
-        file_id_to_query, error = find_file_id_by_name(service, file_name_to_query)
-        if error:
-            return jsonify({"error": error}), 404
-
-        file_content_request = service.files().get_media(fileId=file_id_to_query)
-        file_content = file_content_request.execute()
-        
-        df = pd.read_csv(io.BytesIO(file_content))
-        
-        filter_params = query_params.to_dict()
-        filter_params.pop('fileName', None) 
-        
-        filters = []
-        
-        for key, value in filter_params.items():
-            if key in df.columns:
-                try:
-                    df[key] = df[key].astype(type(value))
-                    filters.append(df[key] == value)
-                except Exception:
-                    try:
-                        df[key] = df[key].astype(float)
-                        filters.append(df[key] == float(value))
-                    except (ValueError, TypeError):
-                        df[key] = df[key].astype(str)
-                        filters.append(df[key].str.lower() == str(value).lower())
-
-        if filters:
-            combined_filter = pd.Series(True, index=df.index)
-            for f in filters:
-                combined_filter = combined_filter & f
-            results_df = df.loc[combined_filter]
-        else:
-            results_df = df
-        
-        if 'operation' in filter_params:
-            op = filter_params['operation'].lower()
-            if op == 'count':
-                return jsonify({"count": len(results_df)})
-            if 'column' in filter_params and op == 'most_produced':
-                most_produced = results_df[filter_params['column']].mode()[0]
-                return jsonify({"most_produced": most_produced})
-
-        results_json = results_df.to_json(orient='records')
-        return jsonify(json.loads(results_json))
-
-    except HttpError as error:
-        return jsonify({"error": str(error)}), 500
+        df[date_col] = pd.to_datetime(df[date_col])
     except Exception as e:
-        return jsonify({"error": f"An error occurred during data processing: {str(e)}"}), 500
+        return jsonify({"error": f"Could not parse date column '{date_col}': {str(e)}"}), 400
+    today = date.today()
+    if today.month <= 3:
+        last_quarter_start = date(today.year - 1, 10, 1)
+    else:
+        q = ((today.month - 1) // 3)
+        last_quarter_start = date(today.year, q * 3 - 2, 1)
+    last_quarter_end_month = (last_quarter_start.month + 2)
+    last_quarter_end = date(last_quarter_start.year, last_quarter_end_month, 
+                            pd.Period(f"{last_quarter_start.year}-{last_quarter_start.month}").asfreq('Q').month_end.day)
+    mask = (df[date_col].dt.date >= last_quarter_start) & (df[date_col].dt.date <= last_quarter_end)
+    df_q = df.loc[mask]
+    operation = query_params.get('operation', '').lower()
+    group_by = query_params.get('groupBy')
+    if operation == 'group_count' and group_by and group_by in df_q.columns:
+        result = df_q.groupby(group_by).size().to_dict()
+        return jsonify(result)
+    return jsonify({"error": "Unsupported operation or missing parameters"}), 400
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
-
