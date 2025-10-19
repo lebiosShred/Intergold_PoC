@@ -25,7 +25,7 @@ def load_credentials_from_env():
             if not os.path.exists(TOKEN_FILE):
                 with open(TOKEN_FILE, 'w') as f:
                     f.write(os.environ['GOOGLE_TOKEN_JSON'])
-    except Exception as e:
+    except:
         return False
     return os.path.exists(CREDENTIALS_FILE) and os.path.exists(TOKEN_FILE)
 
@@ -59,17 +59,17 @@ def find_file_id_by_name(service, file_name):
     except HttpError as error:
         return None, f"An error occurred searching for file: {error}"
 
-def load_dataframe_from_drive(service, file_id, file_name):
+def load_dataframe_from_drive(service, file_id, file_name, usecols=None):
     file_content_request = service.files().get_media(fileId=file_id)
     content = file_content_request.execute()
     if file_name.lower().endswith(('.xlsx', '.xls')):
-        df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+        df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols)
         return df_sheets
     else:
         try:
-            df = pd.read_csv(io.BytesIO(content), encoding='utf-8-sig')
-        except Exception:
-            df = pd.read_csv(io.BytesIO(content), encoding='latin1')
+            df = pd.read_csv(io.BytesIO(content), encoding='utf-8-sig', usecols=usecols)
+        except:
+            df = pd.read_csv(io.BytesIO(content), encoding='latin1', usecols=usecols)
         return {'Sheet1': df}
 
 @app.route('/')
@@ -93,22 +93,6 @@ def list_files():
     except HttpError as error:
         return jsonify({"error": str(error)}), 500
 
-@app.route('/sheets', methods=['GET'])
-def list_sheets():
-    if not load_credentials_from_env():
-        return jsonify({"error": "Server is not configured with Google credentials."}), 500
-    service = get_drive_service()
-    if not service:
-        return jsonify({"error": "Could not authenticate with Google Drive."}), 500
-    file_name_to_query = request.args.get('fileName')
-    if not file_name_to_query:
-        return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
-    file_id, error = find_file_id_by_name(service, file_name_to_query)
-    if error:
-        return jsonify({"error": error}), 404
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query)
-    return jsonify({"sheets": list(sheets.keys())})
-
 @app.route('/query', methods=['GET'])
 def query_data():
     if not load_credentials_from_env():
@@ -123,13 +107,18 @@ def query_data():
     file_id, error = find_file_id_by_name(service, file_name_to_query)
     if error:
         return jsonify({"error": error}), 404
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query)
+    # Only load needed columns: dateColumn, groupBy 
+    date_col = query_params.get('dateColumn', 'OrderDate')
+    group_by = query_params.get('groupBy')
+    if not group_by:
+        return jsonify({"error": "You must provide a 'groupBy' parameter."}), 400
+    usecols = [date_col, group_by]
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=usecols)
     sheet_name = query_params.get('sheetName')
     if sheet_name and sheet_name in sheets:
         df = sheets[sheet_name].copy()
     else:
         df = next(iter(sheets.values())).copy()
-    date_col = query_params.get('dateColumn', 'OrderDate')
     try:
         df[date_col] = pd.to_datetime(df[date_col])
     except Exception as e:
@@ -141,16 +130,12 @@ def query_data():
         q = ((today.month - 1) // 3)
         last_quarter_start = date(today.year, q * 3 - 2, 1)
     last_quarter_end_month = (last_quarter_start.month + 2)
-    last_quarter_end = date(last_quarter_start.year, last_quarter_end_month, 
-                            pd.Period(f"{last_quarter_start.year}-{last_quarter_start.month}").asfreq('Q').month_end.day)
+    last_quarter_end = date(last_quarter_start.year, last_quarter_end_month,
+                             pd.Period(f"{last_quarter_start.year}-{last_quarter_start.month}").asfreq('Q').month_end.day)
     mask = (df[date_col].dt.date >= last_quarter_start) & (df[date_col].dt.date <= last_quarter_end)
     df_q = df.loc[mask]
-    operation = query_params.get('operation', '').lower()
-    group_by = query_params.get('groupBy')
-    if operation == 'group_count' and group_by and group_by in df_q.columns:
-        result = df_q.groupby(group_by).size().to_dict()
-        return jsonify(result)
-    return jsonify({"error": "Unsupported operation or missing parameters"}), 400
+    result = df_q.groupby(group_by).size().to_dict()
+    return jsonify(result)
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
