@@ -59,18 +59,19 @@ def find_file_id_by_name(service, file_name):
     except HttpError as error:
         return None, f"An error occurred searching for file: {error}"
 
-def load_dataframe_from_drive(service, file_id, file_name, usecols=None):
+def load_dataframe_from_drive(service, file_id, file_name, usecols=None, parse_dates=None):
     file_content_request = service.files().get_media(fileId=file_id)
     content = file_content_request.execute()
-    if file_name.lower().endswith(('.xlsx', '.xls')):
-        df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols)
-        return df_sheets
+    if file_name.lower().endswith('.csv'):
+        df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates)
+        return {'Sheet1': df}
     else:
         try:
-            df = pd.read_csv(io.BytesIO(content), encoding='utf-8-sig', usecols=usecols)
-        except:
-            df = pd.read_csv(io.BytesIO(content), encoding='latin1', usecols=usecols)
-        return {'Sheet1': df}
+            df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols)
+            return df_sheets
+        except Exception:
+            df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates)
+            return {'Sheet1': df}
 
 @app.route('/')
 def index():
@@ -100,25 +101,17 @@ def query_data():
     service = get_drive_service()
     if not service:
         return jsonify({"error": "Could not authenticate with Google Drive."}), 500
-    query_params = request.args
-    file_name_to_query = query_params.get('fileName')
+    file_name_to_query = request.args.get('fileName')
     if not file_name_to_query:
         return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
     file_id, error = find_file_id_by_name(service, file_name_to_query)
     if error:
         return jsonify({"error": error}), 404
-    # Only load needed columns: dateColumn, groupBy 
-    date_col = query_params.get('dateColumn', 'OrderDate')
-    group_by = query_params.get('groupBy')
-    if not group_by:
-        return jsonify({"error": "You must provide a 'groupBy' parameter."}), 400
+    date_col = request.args.get('dateColumn', 'OrdDate')
+    group_by = request.args.get('groupBy', 'SOType')
     usecols = [date_col, group_by]
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=usecols)
-    sheet_name = query_params.get('sheetName')
-    if sheet_name and sheet_name in sheets:
-        df = sheets[sheet_name].copy()
-    else:
-        df = next(iter(sheets.values())).copy()
+    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=usecols, parse_dates=[date_col])
+    df = next(iter(sheets.values())).copy()
     try:
         df[date_col] = pd.to_datetime(df[date_col])
     except Exception as e:
