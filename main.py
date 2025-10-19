@@ -1,66 +1,138 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import os
-import logging
-from processing import load_excel_from_bytes, classify_order_type, reclassify_kt, process_query, fetch_file_from_box
+import dropbox
+from flask import Flask, request, jsonify
 
-app = FastAPI()
-logging.basicConfig(level=logging.INFO)
+# --- Configuration ---
+# Initialize the Flask application
+app = Flask(__name__)
 
-# Allowed values
-ALLOWED_METRICS = ["Total Bag Bal","Bal To Prod Qty","Bal To Exp Qty","BalToMfg","CastBal"]
-ALLOWED_ATTRIBUTES = ["SO type","Dsg Ctg","KT","Set Type","Factory"]
-ALLOWED_ORDER_TYPES = ["LGD","Mined"]
+# Retrieve the Dropbox Access Token from an environment variable for security.
+# This will be set in the Render dashboard.
+DROPBOX_ACCESS_TOKEN = os.environ.get('DROPBOX_ACCESS_TOKEN')
 
-class QueryRequest(BaseModel):
-    box_folder_id: str = Field(..., example="123456789")
-    filename: str = Field(..., example="InterGold_Report.xlsx")
-    metric: str = Field(..., example="Total Bag Bal")
-    order_type: str = Field(..., example="LGD")
-    attributes: list[str] = Field(..., example=["Dsg Ctg","Set Type"])
-    top_n: int | None = Field(None, example=3)
+# --- Helper Functions ---
 
-@app.post("/query-from-box")
-def query_from_box(req: QueryRequest):
-    logging.info(f"Received request: {req}")
-    if req.metric not in ALLOWED_METRICS:
-        raise HTTPException(status_code=400, detail=f"Invalid metric: {req.metric}")
-    if req.order_type not in ALLOWED_ORDER_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid order_type: {req.order_type}")
-    if not req.attributes:
-        raise HTTPException(status_code=400, detail="Must supply at least one attribute")
-    bad_attrs = [a for a in req.attributes if a not in ALLOWED_ATTRIBUTES]
-    if bad_attrs:
-        raise HTTPException(status_code=400, detail=f"Invalid attributes: {bad_attrs}")
+def initialize_dropbox_client():
+    """Initializes and returns a Dropbox client instance.
+    
+    Returns:
+        dropbox.Dropbox: An authenticated Dropbox client instance.
+        None: If the access token is not configured.
+    """
+    if not DROPBOX_ACCESS_TOKEN:
+        print("Error: The DROPBOX_ACCESS_TOKEN environment variable is not set.")
+        return None
+    try:
+        dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+        # Test the connection by getting current account info
+        dbx.users_get_current_account()
+        print("Successfully connected to Dropbox.")
+        return dbx
+    except dropbox.exceptions.AuthError:
+        print("Error: Invalid Dropbox access token. Please check your token.")
+        return None
+    except Exception as e:
+        print(f"An error occurred during Dropbox initialization: {e}")
+        return None
 
-    token = os.getenv("BOX_DEVELOPER_TOKEN")
-    if not token:
-        raise HTTPException(status_code=500, detail="Box developer token not configured")
+def list_folders_in_root():
+    """Lists all folders in the root directory of the Dropbox account.
+    
+    Returns:
+        dict: A dictionary containing a list of folder names or an error message.
+    """
+    dbx = initialize_dropbox_client()
+    if not dbx:
+        return {"error": "Dropbox client could not be initialized."}
+        
+    try:
+        folders = []
+        # List items in the root folder (path="")
+        for entry in dbx.files_list_folder(path="").entries:
+            if isinstance(entry, dropbox.files.FolderMetadata):
+                folders.append(entry.name)
+        return {"folders": folders}
+    except Exception as e:
+        return {"error": f"Failed to list Dropbox folders: {e}"}
+
+def find_file(file_name):
+    """Searches for a file in the Dropbox account.
+    
+    Args:
+        file_name (str): The name of the file to search for.
+    
+    Returns:
+        dict: A dictionary containing details of the found file or an error message.
+    """
+    dbx = initialize_dropbox_client()
+    if not dbx:
+        return {"error": "Dropbox client could not be initialized."}
 
     try:
-        file_bytes = fetch_file_from_box(req.box_folder_id, req.filename, token)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        # Search for files matching the query
+        search_result = dbx.files_search_v2(file_name).matches
+        if not search_result:
+            return {"message": f"No file matching '{file_name}' was found."}
+        
+        # Get the metadata for the first match
+        first_match = search_result[0].metadata.get_metadata()
+        
+        file_details = {
+            "name": first_match.name,
+            "path": first_match.path_display,
+            "size_mb": round(first_match.size / (1024 * 1024), 2),
+            "last_modified": first_match.client_modified.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        return {"file_found": file_details}
     except Exception as e:
-        logging.error("Error fetching from Box", exc_info=e)
-        raise HTTPException(status_code=500, detail="Error fetching file from Box")
+        return {"error": f"An error occurred while searching for the file: {e}"}
 
+# --- Flask API Endpoint ---
+
+@app.route('/invoke', methods=['POST'])
+def invoke_skill():
+    """
+    This is the main endpoint that Watson Orchestrate will call.
+    It parses the user's prompt and triggers the corresponding Dropbox action.
+    """
     try:
-        df = load_excel_from_bytes(file_bytes)
-        df = classify_order_type(df)
-        df = reclassify_kt(df)
-        result = process_query(
-            df,
-            req.order_type,
-            req.metric,
-            req.attributes,
-            top_n=req.top_n
-        )
-        return result
-    except Exception as e:
-        logging.error("Error processing query", exc_info=e)
-        raise HTTPException(status_code=500, detail="Error processing data")
+        data = request.get_json()
+        if not data or 'prompt' not in data:
+            return jsonify({"error": "Invalid request. 'prompt' is required."}), 400
 
-@app.get("/health")
-def health():
-    return {"status":"OK"}
+        prompt = data.get('prompt', '').lower().strip()
+        print(f"Received prompt: '{prompt}'")
+
+        # Basic intent recognition based on keywords in the prompt
+        if "all the folders" in prompt or "list folders" in prompt:
+            response = list_folders_in_root()
+        elif "show me file" in prompt or "find file" in prompt:
+            # Extract the file name from the prompt
+            query = prompt.replace("show me file", "").replace("find file", "").strip()
+            if not query:
+                return jsonify({"error": "Please specify a file name to search for."}), 400
+            response = find_file(query)
+        else:
+            response = {"error": "Sorry, I can only 'show all folders' or 'find file <name>'."}
+
+        return jsonify(response)
+
+    except Exception as e:
+        return jsonify({"error": f"An unexpected server error occurred: {e}"}), 500
+
+# --- Main Execution ---
+
+if __name__ == '__main__':
+    # This block is for local development.
+    # When deploying to a production environment like Render, a WSGI server
+    # like Gunicorn will be used to run the app, and this block will not be executed.
+    if not DROPBOX_ACCESS_TOKEN:
+        print("\nFATAL ERROR: 'DROPBOX_ACCESS_TOKEN' is not set.")
+        print("Please set it as an environment variable before running the script.")
+        print("Example (Linux/macOS): export DROPBOX_ACCESS_TOKEN='your-token'")
+        print("Example (Windows): set DROPBOX_ACCESS_TOKEN='your-token'\n")
+    else:
+        # Render provides a PORT environment variable. For local dev, we default to 5000.
+        port = int(os.environ.get('PORT', 5000))
+        # Debug mode should be turned off in a production environment.
+        app.run(host='0.0.0.0', port=port)
