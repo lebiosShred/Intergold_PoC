@@ -230,6 +230,110 @@ def check_headers():
     except Exception as ex:
         return jsonify({"error": f"Could not load file to inspect headers: {str(ex)}"}), 500
 
+@app.route('/test_date_parsing', methods=['GET'])
+def test_date_parsing():
+    """Test endpoint to check date parsing for a specific column"""
+    if not load_credentials_from_env():
+        return jsonify({"error": "Server is not configured with Google credentials."}), 500
+    service = get_drive_service()
+    if not service:
+        return jsonify({"error": "Could not authenticate with Google Drive."}), 500
+    
+    file_name = request.args.get('fileName')
+    date_column = request.args.get('dateColumn', 'OrdDate')
+    
+    if not file_name:
+        return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
+    
+    file_id, err = find_file_id_by_name(service, file_name)
+    if err:
+        return jsonify({"error": err}), 404
+    
+    try:
+        # Load with auto-detection
+        sheets = load_dataframe_from_drive(service, file_id, file_name, auto_detect=True)
+        metadata = sheets.pop('_metadata', None)
+        df = next(iter(sheets.values())).copy()
+        
+        # Find the date column (case-insensitive)
+        cols = df.columns.tolist()
+        norm = {c.strip().lower(): c for c in cols}
+        date_key = date_column.strip().lower()
+        
+        if date_key not in norm:
+            return jsonify({"error": f"Date column '{date_column}' not found. Available: {cols}"}), 400
+        
+        date_col = norm[date_key]
+        
+        # Get sample values before parsing
+        sample_before = df[date_col].head(10).tolist()
+        
+        # Try parsing with different strategies
+        parsing_results = []
+        
+        # Strategy 1: infer_datetime_format
+        try:
+            test_df = df.copy()
+            test_df[date_col] = pd.to_datetime(test_df[date_col], infer_datetime_format=True, errors='coerce')
+            valid_count = test_df[date_col].notna().sum()
+            parsing_results.append({
+                "strategy": "infer_datetime_format",
+                "validDates": valid_count,
+                "invalidDates": len(test_df) - valid_count,
+                "successRate": f"{(valid_count/len(test_df)*100):.1f}%",
+                "sample": test_df[date_col].head(5).astype(str).tolist()
+            })
+        except Exception as e:
+            parsing_results.append({"strategy": "infer_datetime_format", "error": str(e)})
+        
+        # Strategy 2: dayfirst=True (DD/MM/YYYY)
+        try:
+            test_df = df.copy()
+            test_df[date_col] = pd.to_datetime(test_df[date_col], dayfirst=True, errors='coerce')
+            valid_count = test_df[date_col].notna().sum()
+            parsing_results.append({
+                "strategy": "dayfirst=True (DD/MM/YYYY)",
+                "validDates": valid_count,
+                "invalidDates": len(test_df) - valid_count,
+                "successRate": f"{(valid_count/len(test_df)*100):.1f}%",
+                "sample": test_df[date_col].head(5).astype(str).tolist()
+            })
+        except Exception as e:
+            parsing_results.append({"strategy": "dayfirst=True", "error": str(e)})
+        
+        # Strategy 3: Common formats
+        for fmt, name in [('%d/%m/%Y', 'DD/MM/YYYY'), ('%m/%d/%Y', 'MM/DD/YYYY'), 
+                          ('%Y-%m-%d', 'YYYY-MM-DD'), ('%d-%m-%Y', 'DD-MM-YYYY')]:
+            try:
+                test_df = df.copy()
+                test_df[date_col] = pd.to_datetime(test_df[date_col], format=fmt, errors='coerce')
+                valid_count = test_df[date_col].notna().sum()
+                parsing_results.append({
+                    "strategy": f"format='{fmt}' ({name})",
+                    "validDates": valid_count,
+                    "invalidDates": len(test_df) - valid_count,
+                    "successRate": f"{(valid_count/len(test_df)*100):.1f}%",
+                    "sample": test_df[date_col].head(5).astype(str).tolist()
+                })
+            except Exception as e:
+                parsing_results.append({"strategy": f"format='{fmt}'", "error": str(e)})
+        
+        # Find best strategy
+        best_strategy = max([r for r in parsing_results if 'error' not in r], 
+                           key=lambda x: x['validDates'], default=None)
+        
+        return jsonify({
+            "dateColumn": date_col,
+            "totalRows": len(df),
+            "sampleValuesBefore": sample_before,
+            "parsingResults": parsing_results,
+            "recommendedStrategy": best_strategy['strategy'] if best_strategy else "Unable to parse dates",
+            "autoDetectedSkipRows": metadata['auto_detected_skiprows'] if metadata else 0
+        })
+        
+    except Exception as ex:
+        return jsonify({"error": f"Error testing date parsing: {str(ex)}"}), 500
+
 @app.route('/query', methods=['GET'])
 def query_data():
     if not load_credentials_from_env():
@@ -290,10 +394,38 @@ def query_data():
     group_by = norm[req_group_key]
     df = df[[date_col, group_by]].copy()
     
+    # Try multiple date parsing strategies
     try:
-        df[date_col] = pd.to_datetime(df[date_col])
+        # First, try with infer_datetime_format for automatic detection
+        df[date_col] = pd.to_datetime(df[date_col], infer_datetime_format=True, errors='coerce')
+        
+        # If that fails (many NaT values), try with dayfirst=True for DD/MM/YYYY format
+        if df[date_col].isna().sum() > len(df) * 0.5:
+            df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
+        
+        # If still many NaT values, try common formats explicitly
+        if df[date_col].isna().sum() > len(df) * 0.5:
+            for fmt in ['%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d']:
+                try:
+                    df[date_col] = pd.to_datetime(df[date_col], format=fmt, errors='coerce')
+                    if df[date_col].isna().sum() < len(df) * 0.5:
+                        break
+                except:
+                    continue
+        
+        # Check if we still have too many invalid dates
+        invalid_count = df[date_col].isna().sum()
+        if invalid_count > len(df) * 0.5:
+            return jsonify({"error": f"Could not parse date column '{date_col}': Too many invalid dates ({invalid_count}/{len(df)}). Sample values: {df[date_col].head(3).tolist()}"}), 400
+            
     except Exception as e:
         return jsonify({"error": f"Could not parse date column '{date_col}': {str(e)}"}), 400
+    
+    # Filter out any rows with invalid dates before calculating quarter
+    df = df[df[date_col].notna()].copy()
+    
+    if len(df) == 0:
+        return jsonify({"error": "No valid dates found in the date column after parsing"}), 400
     
     today = date.today()
     if today.month <= 3:
@@ -316,8 +448,10 @@ def query_data():
             "quarterStart": last_quarter_start.isoformat(),
             "quarterEnd": last_quarter_end.isoformat(),
             "totalRecords": len(df_q),
+            "totalRecordsBeforeFilter": len(df),
             "dateColumn": date_col,
-            "groupByColumn": group_by
+            "groupByColumn": group_by,
+            "dateFormat": "auto-detected"
         }
     }
     
