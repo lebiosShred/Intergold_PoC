@@ -54,7 +54,7 @@ def get_drive_service():
         return None
 
 def find_file_id_by_name(service, file_name):
-    search_query = f"name='{file_name}' and trashed=false"
+    search_query = f"name contains '{file_name}' and trashed=false"
     try:
         results = service.files().list(
             q=search_query,
@@ -169,3 +169,4 @@ def query_data():
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
+
