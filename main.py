@@ -103,16 +103,24 @@ def invoke_skill():
         prompt = data.get('prompt', '').lower().strip()
         print(f"Received prompt: '{prompt}'")
 
-        # Basic intent recognition based on keywords in the prompt
-        if "all the folders" in prompt or "list folders" in prompt:
-            response = list_folders_in_root()
-        elif "show me file" in prompt or "find file" in prompt:
-            # Extract the file name from the prompt
+        # --- REVISED LOGIC ---
+        # We must check for the most *specific* intent first.
+        # "show me file" is more specific than "show me... folders".
+        
+        if "show me file" in prompt or "find file" in prompt:
+            # This is the "find file" intent
             query = prompt.replace("show me file", "").replace("find file", "").strip()
             if not query:
-                return jsonify({"error": "Please specify a file name to search for."}), 400
-            response = find_file(query)
+                response = {"error": "Please specify a file name to search for."}
+            else:
+                response = find_file(query)
+
+        elif "all folders" in prompt or "list folders" in prompt:
+            # This is the "list folders" intent
+            response = list_folders_in_root()
+            
         else:
+            # This is the catch-all error
             response = {"error": "Sorry, I can only 'show all folders' or 'find file <name>'."}
 
         return jsonify(response)
@@ -124,15 +132,9 @@ def invoke_skill():
 
 if __name__ == '__main__':
     # This block is for local development.
-    # When deploying to a production environment like Render, a WSGI server
-    # like Gunicorn will be used to run the app, and this block will not be executed.
     if not DROPBOX_ACCESS_TOKEN:
         print("\nFATAL ERROR: 'DROPBOX_ACCESS_TOKEN' is not set.")
         print("Please set it as an environment variable before running the script.")
-        print("Example (Linux/macOS): export DROPBOX_ACCESS_TOKEN='your-token'")
-        print("Example (Windows): set DROPBOX_ACCESS_TOKEN='your-token'\n")
     else:
-        # Render provides a PORT environment variable. For local dev, we default to 5000.
         port = int(os.environ.get('PORT', 5000))
-        # Debug mode should be turned off in a production environment.
         app.run(host='0.0.0.0', port=port)
