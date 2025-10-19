@@ -219,13 +219,23 @@ def query_data():
     if valid_rows == 0:
         return jsonify({"error": f"No valid dates found in column '{date_col}' after parsing"}), 400
     today = date.today()
-    if today.month <= 3:
-        last_quarter_start = date(today.year - 1, 10, 1)
+  if today.month <= 3:
+    last_quarter_start = date(today.year - 1, 10, 1)
+    last_quarter_end = date(today.year - 1, 12, 31)
+else:
+    q = ((today.month - 1) // 3)
+    last_quarter_start_month = (q * 3) - 2
+    last_quarter_start = date(today.year, last_quarter_start_month, 1)
+    # end month = start_month + 2
+    last_quarter_end_month = last_quarter_start_month + 2
+    # determine last day of that month:
+    # by building date of (next month 1) minus 1 day
+    if last_quarter_end_month == 12:
+        next_month = date(last_quarter_start.year + 1, 1, 1)
     else:
-        q = ((today.month - 1) // 3)
-        last_quarter_start = date(today.year, q * 3 - 2, 1)
-    last_quarter_end_month = last_quarter_start.month + 2
-    last_quarter_end = date(last_quarter_start.year, last_quarter_end_month, pd.Period(f"{last_quarter_start.year}-{last_quarter_start.month}").asfreq('Q').month_end.day)
+        next_month = date(last_quarter_start.year, last_quarter_end_month + 1, 1)
+    last_quarter_end = next_month - pd.Timedelta(days=1)
+
     mask = (df[date_col].dt.date >= last_quarter_start) & (df[date_col].dt.date <= last_quarter_end)
     df_q = df.loc[mask]
     group_counts = df_q.groupby(group_by).size().to_dict()
@@ -249,3 +259,4 @@ def query_data():
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
+
