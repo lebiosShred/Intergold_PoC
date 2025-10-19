@@ -94,6 +94,32 @@ def list_files():
     except HttpError as error:
         return jsonify({"error": str(error)}), 500
 
+@app.route('/check_headers', methods=['GET'])
+def check_headers():
+    if not load_credentials_from_env():
+        return jsonify({"error": "Server is not configured with Google credentials."}), 500
+    service = get_drive_service()
+    if not service:
+        return jsonify({"error": "Could not authenticate with Google Drive."}), 500
+    file_name = request.args.get('fileName')
+    if not file_name:
+        return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
+    file_id, err = find_file_id_by_name(service, file_name)
+    if err:
+        return jsonify({"error": err}), 404
+    try:
+        content = service.files().get_media(fileId=file_id).execute()
+        # Attempt CSV first
+        df = pd.read_csv(io.BytesIO(content), nrows=0)
+    except Exception:
+        try:
+            # Fallback to Excel if CSV fails
+            df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', nrows=0)
+        except Exception as ex:
+            return jsonify({"error": f"Could not load file to inspect headers: {str(ex)}"}), 500
+    cols = df.columns.tolist()
+    return jsonify({"columns": cols})
+
 @app.route('/query', methods=['GET'])
 def query_data():
     if not load_credentials_from_env():
