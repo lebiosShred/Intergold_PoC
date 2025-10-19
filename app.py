@@ -59,23 +59,81 @@ def find_file_id_by_name(service, file_name):
     except HttpError as error:
         return None, f"An error occurred searching for file: {error}"
 
-def load_dataframe_from_drive(service, file_id, file_name, usecols=None, parse_dates=None, skiprows=None):
+def detect_header_row(content, file_name, max_rows_to_check=5):
+    """
+    Automatically detect which row contains the actual headers.
+    Returns the skiprows value (0 if headers are in first row, 1 if in second, etc.)
+    """
+    try:
+        # Try reading first few rows to analyze
+        for skip in range(max_rows_to_check):
+            try:
+                if file_name.lower().endswith('.csv'):
+                    df = pd.read_csv(io.BytesIO(content), skiprows=skip, nrows=3)
+                else:
+                    df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', skiprows=skip, nrows=3)
+                
+                cols = df.columns.tolist()
+                
+                # Analyze column quality
+                unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed:'))
+                numeric_count = sum(1 for c in cols if str(c).replace('.', '').replace('-', '').isdigit())
+                empty_count = sum(1 for c in cols if not str(c).strip())
+                text_count = len(cols) - unnamed_count - numeric_count - empty_count
+                
+                # Good header criteria: >50% text columns, <30% numeric/unnamed
+                is_good_header = (
+                    text_count > len(cols) * 0.5 and
+                    (unnamed_count + numeric_count) < len(cols) * 0.3 and
+                    len(cols) > 3  # Must have at least 4 columns
+                )
+                
+                if is_good_header:
+                    return skip, cols
+                    
+            except Exception:
+                continue
+        
+        # If no good header found, default to row 0
+        return 0, None
+        
+    except Exception:
+        return 0, None
+
+def load_dataframe_from_drive(service, file_id, file_name, usecols=None, parse_dates=None, skiprows=None, auto_detect=False):
     file_content_request = service.files().get_media(fileId=file_id)
     content = file_content_request.execute()
+    
+    # Auto-detect header row if requested and skiprows not explicitly set
+    detected_skip = None
+    detected_cols = None
+    if auto_detect and skiprows is None:
+        detected_skip, detected_cols = detect_header_row(content, file_name)
+        skiprows = detected_skip
+    
     if file_name.lower().endswith('.csv'):
         df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates, skiprows=skiprows)
-        return {'Sheet1': df}
+        result = {'Sheet1': df}
     else:
         try:
             df_sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, engine='openpyxl', usecols=usecols, skiprows=skiprows)
-            return df_sheets
+            result = df_sheets
         except Exception:
             df = pd.read_csv(io.BytesIO(content), usecols=usecols, parse_dates=parse_dates, skiprows=skiprows)
-            return {'Sheet1': df}
+            result = {'Sheet1': df}
+    
+    # Add metadata about detection
+    if auto_detect and detected_skip is not None:
+        result['_metadata'] = {
+            'auto_detected_skiprows': detected_skip,
+            'detected_columns': detected_cols
+        }
+    
+    return result
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "message": "Google Drive connector is running."})
+    return jsonify({"status": "ok", "message": "Google Drive connector is running with auto-header detection."})
 
 @app.route('/files', methods=['GET'])
 def list_files():
@@ -105,50 +163,72 @@ def check_headers():
     if not file_name:
         return jsonify({"error": "You must provide a 'fileName' parameter."}), 400
     
-    # Optional parameter to skip rows before header
-    skip_rows = request.args.get('skipRows', 0)
-    try:
-        skip_rows = int(skip_rows)
-    except:
-        skip_rows = 0
+    # Check if auto-detect is requested (default: true)
+    auto_detect = request.args.get('autoDetect', 'true').lower() == 'true'
+    
+    # Optional manual skipRows parameter
+    skip_rows = request.args.get('skipRows', None)
+    if skip_rows is not None:
+        try:
+            skip_rows = int(skip_rows)
+            auto_detect = False  # Manual override
+        except:
+            skip_rows = None
     
     file_id, err = find_file_id_by_name(service, file_name)
     if err:
         return jsonify({"error": err}), 404
+    
     try:
         content = service.files().get_media(fileId=file_id).execute()
-        # Attempt CSV first with skiprows parameter
-        df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows, nrows=5)
-    except Exception:
-        try:
-            # Fallback to Excel if CSV fails
-            df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', skiprows=skip_rows, nrows=5)
-        except Exception as ex:
-            return jsonify({"error": f"Could not load file to inspect headers: {str(ex)}"}), 500
-    
-    cols = df.columns.tolist()
-    
-    # Check if we got bad headers (all Unnamed or mostly numeric)
-    unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed:'))
-    numeric_count = sum(1 for c in cols if str(c).replace('.', '').replace('-', '').isdigit())
-    
-    warning = None
-    if unnamed_count > len(cols) * 0.3 or numeric_count > len(cols) * 0.3:
-        warning = "Warning: Many columns appear unnamed or numeric. The file may have headers in a different row. Try using skipRows parameter (e.g., ?skipRows=1)"
-    
-    # Also return first few rows as preview to help identify header location
-    preview = df.head(3).to_dict('records') if len(df) > 0 else []
-    
-    result = {
-        "columns": cols,
-        "columnCount": len(cols),
-        "preview": preview
-    }
-    
-    if warning:
-        result["warning"] = warning
-    
-    return jsonify(result)
+        
+        # Auto-detect if requested
+        if auto_detect and skip_rows is None:
+            detected_skip, detected_cols = detect_header_row(content, file_name)
+            skip_rows = detected_skip
+            was_auto_detected = True
+        else:
+            detected_cols = None
+            was_auto_detected = False
+            if skip_rows is None:
+                skip_rows = 0
+        
+        # Read with detected/specified skiprows
+        if file_name.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows, nrows=5)
+        else:
+            try:
+                df = pd.read_excel(io.BytesIO(content), sheet_name=0, engine='openpyxl', skiprows=skip_rows, nrows=5)
+            except Exception:
+                df = pd.read_csv(io.BytesIO(content), skiprows=skip_rows, nrows=5)
+        
+        cols = df.columns.tolist()
+        
+        # Analyze current headers
+        unnamed_count = sum(1 for c in cols if str(c).startswith('Unnamed:'))
+        numeric_count = sum(1 for c in cols if str(c).replace('.', '').replace('-', '').isdigit())
+        
+        warning = None
+        if unnamed_count > len(cols) * 0.3 or numeric_count > len(cols) * 0.3:
+            warning = f"Warning: Many columns appear unnamed or numeric at row {skip_rows}. Headers may be in a different row."
+        
+        preview = df.head(3).to_dict('records') if len(df) > 0 else []
+        
+        result = {
+            "columns": cols,
+            "columnCount": len(cols),
+            "preview": preview,
+            "skipRowsUsed": skip_rows,
+            "autoDetected": was_auto_detected
+        }
+        
+        if warning:
+            result["warning"] = warning
+        
+        return jsonify(result)
+        
+    except Exception as ex:
+        return jsonify({"error": f"Could not load file to inspect headers: {str(ex)}"}), 500
 
 @app.route('/query', methods=['GET'])
 def query_data():
@@ -163,34 +243,58 @@ def query_data():
     file_id, error = find_file_id_by_name(service, file_name_to_query)
     if error:
         return jsonify({"error": error}), 404
+    
     query_params = request.args
     requested_date_col_raw = query_params.get('dateColumn', 'OrdDate')
     requested_group_by_raw = query_params.get('groupBy', 'SOType')
     
-    # Add skipRows parameter support
+    # Check if auto-detect is enabled (default: true)
+    auto_detect = query_params.get('autoDetect', 'true').lower() == 'true'
+    
+    # Manual skipRows parameter (overrides auto-detect)
     skip_rows = query_params.get('skipRows', None)
     if skip_rows is not None:
         try:
             skip_rows = int(skip_rows)
+            auto_detect = False
         except:
             skip_rows = None
     
-    usecols = None  # until columns matched
-    sheets = load_dataframe_from_drive(service, file_id, file_name_to_query, usecols=None, parse_dates=None, skiprows=skip_rows)
+    # Load dataframe with auto-detection or manual skiprows
+    sheets = load_dataframe_from_drive(
+        service, 
+        file_id, 
+        file_name_to_query, 
+        usecols=None, 
+        parse_dates=None, 
+        skiprows=skip_rows,
+        auto_detect=auto_detect
+    )
+    
+    # Extract metadata if available
+    metadata = sheets.pop('_metadata', None)
+    
     df = next(iter(sheets.values())).copy()
     cols = df.columns.tolist()
     norm = {c.strip().lower(): c for c in cols}
     req_date_key = requested_date_col_raw.strip().lower()
     req_group_key = requested_group_by_raw.strip().lower()
+    
     if req_date_key not in norm or req_group_key not in norm:
-        return jsonify({"error": f"Could not find required columns. Available: {cols}"}), 400
+        error_msg = f"Could not find required columns. Available: {cols}"
+        if metadata:
+            error_msg += f" (Auto-detected header at row {metadata['auto_detected_skiprows']})"
+        return jsonify({"error": error_msg}), 400
+    
     date_col = norm[req_date_key]
     group_by = norm[req_group_key]
     df = df[[date_col, group_by]].copy()
+    
     try:
         df[date_col] = pd.to_datetime(df[date_col])
     except Exception as e:
         return jsonify({"error": f"Could not parse date column '{date_col}': {str(e)}"}), 400
+    
     today = date.today()
     if today.month <= 3:
         last_quarter_start = date(today.year - 1, 10, 1)
@@ -200,10 +304,27 @@ def query_data():
     last_quarter_end_month = (last_quarter_start.month + 2)
     last_quarter_end = date(last_quarter_start.year, last_quarter_end_month,
                              pd.Period(f"{last_quarter_start.year}-{last_quarter_start.month}").asfreq('Q').month_end.day)
+    
     mask = (df[date_col].dt.date >= last_quarter_start) & (df[date_col].dt.date <= last_quarter_end)
     df_q = df.loc[mask]
     result = df_q.groupby(group_by).size().to_dict()
-    return jsonify(result)
+    
+    # Add metadata to response
+    response = {
+        "data": result,
+        "metadata": {
+            "quarterStart": last_quarter_start.isoformat(),
+            "quarterEnd": last_quarter_end.isoformat(),
+            "totalRecords": len(df_q),
+            "dateColumn": date_col,
+            "groupByColumn": group_by
+        }
+    }
+    
+    if metadata:
+        response["metadata"]["autoDetectedSkipRows"] = metadata['auto_detected_skiprows']
+    
+    return jsonify(response)
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
