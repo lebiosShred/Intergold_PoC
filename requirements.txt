@@ -1,6 +1,3 @@
-fastapi
-uvicorn[standard]
-pandas
-openpyxl
-python-dotenv
-boxsdk~=3.0
+Flask
+dropbox
+gunicorn
