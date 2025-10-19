@@ -3,4 +3,4 @@ uvicorn[standard]
 pandas
 openpyxl
 python-dotenv
-boxsdk
+boxsdk~=3.0
