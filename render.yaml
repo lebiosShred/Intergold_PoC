@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: watsonx-drive-api
+    runtime: python
+    plan: free # Use Render's free tier
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.4
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false # Set this in the Render dashboard (it's a secret)
+      - key: GOOGLE_TOKEN_JSON
+        sync: false # Set this in the Render dashboard (it's a secret)
